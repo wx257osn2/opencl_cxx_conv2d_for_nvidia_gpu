@@ -1,3 +1,76 @@
+namespace detail{
+
+template<int KernelSize, int J, int I>
+static inline float unroll_x(
+    const int x,
+    const int y,
+    __global const unsigned char* __restrict__ im,
+    const int width,
+    __global const float* __restrict__ kern){
+  static constexpr int half_size = KernelSize/2;
+  static constexpr int dx = I - half_size;
+  static constexpr int dy = J - half_size;
+  if constexpr(I == 0)
+    return im[(y+dy)*width+x+dx] * kern[J*KernelSize];
+  else
+    return im[(y+dy)*width+x+dx] * kern[J*KernelSize+I] + unroll_x<KernelSize, J, I-1>(x, y, im, width, kern);
+}
+
+template<int KernelSize, int J>
+static inline float unroll_y(
+    const int x,
+    const int y,
+    __global const uchar* __restrict__ im,
+    const int width,
+    __global const float* __restrict__ kern){
+  if constexpr(J == 0)
+    return unroll_x<KernelSize, 0, KernelSize-1>(x, y, im, width, kern);
+  else
+    return unroll_x<KernelSize, J, KernelSize-1>(x, y, im, width, kern)
+         + unroll_y<KernelSize, J-1>(x, y, im, width, kern);
+}
+
+template<int KernelSize>
+static inline float unroll(
+    const int x,
+    const int y,
+    __global const uchar* __restrict__ im,
+    const int width,
+    __global const float* __restrict__ kern){
+  return unroll_y<KernelSize, KernelSize-1>(x, y, im, width, kern);
+}
+
+}
+
+template<size_t KernelSize>
+static void convolution_unrolled(
+    __global const unsigned char* __restrict__ im,
+    int width,
+    int height,
+    __global const float* __restrict__ kern,
+    __global unsigned char* __restrict__ output){
+  const int x = get_global_id(0);
+  const int y = get_global_id(1);
+
+  const int half_k = KernelSize / 2;
+  if(y < half_k
+  || height - half_k <= y
+  || x < half_k
+  || width - half_k <= x)
+    return;
+  output[y*width+x] = (unsigned char)(min(max(detail::unroll<KernelSize>(x, y, im, width, kern), 0.f), 255.f));
+}
+
+__kernel void convolution_3x3(
+    __global const unsigned char* __restrict__ im,
+    int width,
+    int height,
+    __global const float* __restrict__ kern,
+    int,
+    __global unsigned char* __restrict__ output){
+  convolution_unrolled<3>(im, width, height, kern, output);
+}
+
 __kernel void convolution_general(
     __global const unsigned char* __restrict__ im,
     int width,

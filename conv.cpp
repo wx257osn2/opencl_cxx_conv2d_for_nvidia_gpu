@@ -192,7 +192,7 @@ static void convolution_gpu(const std::filesystem::path& nvptx, image& im, const
   cu_memcpy_h2d(device_kernel.data, kernel, kernel_size*kernel_size*sizeof(float));
 
   cu_module module(nvptx);
-  auto func = module.get_function("convolution_general");
+  auto func = module.get_function(kernel_size == 3 ? "convolution_3x3" : "convolution_general");
 
   {
     int width = im.get_width();
