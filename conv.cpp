@@ -68,44 +68,110 @@ inline void G2GGGA(const unsigned char* src, std::size_t num, unsigned char* dst
   }
 }
 
-template<typename T>
-[[nodiscard]] static std::unique_ptr<T, decltype(&::cudaFree)> create_cuda_buffer(std::size_t N){
-  void* ptr = nullptr;
-  {
-    const auto ret = ::cudaMalloc(&ptr, N * sizeof(T));
-    if(ret != cudaSuccess)
-      throw std::runtime_error(std::string{"cudaMalloc: "} + ::cudaGetErrorName(ret));
+static std::string cu_get_error_name(::CUresult res){
+  const char* ptr;
+  const auto err = ::cuGetErrorName(res, &ptr);
+  if(err != CUDA_SUCCESS)
+    throw std::runtime_error("cu_get_error_name" + cu_get_error_name(err));
+  return std::string{ptr};
+}
+
+static void cu_init(){
+  const auto err = ::cuInit(0);
+  if(err != CUDA_SUCCESS)
+    throw std::runtime_error("cuInit: " + cu_get_error_name(err));
+}
+
+class cu_module{
+  ::CUmodule data;
+ public:
+  explicit cu_module(const std::filesystem::path& path){
+    const auto err = ::cuModuleLoad(&data, path.string().c_str());
+    if(err != CUDA_SUCCESS)
+      throw std::runtime_error("cuModuleLoadDataEx : " + cu_get_error_name(err));
   }
-  return std::unique_ptr<T, decltype(&::cudaFree)>(static_cast<T*>(ptr), &::cudaFree);
+  ~cu_module(){::cuModuleUnload(data);}
+  ::CUfunction get_function(const char* func_name)const{
+    ::CUfunction func;
+    const auto err = ::cuModuleGetFunction(&func, data, func_name);
+    if(err != CUDA_SUCCESS)
+      throw std::runtime_error("cuModuleGetFunction : " + cu_get_error_name(err));
+    return func;
+  }
+};
+
+::CUdevice cu_get_device(int ordinal){
+  ::CUdevice dev;
+  const auto err = ::cuDeviceGet(&dev, ordinal);
+  if(err != CUDA_SUCCESS)
+    throw std::runtime_error("cuDeviceGet: " + cu_get_error_name(err));
+  return dev;
 }
 
-static void cuda_memcpy_h2d(void* dst, const void* src, std::size_t size){
-  const auto err = ::cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice);
-  if(err != cudaSuccess)
-    throw std::runtime_error(std::string{"cudaMemcpy: "} + ::cudaGetErrorName(err));
+struct cu_device_ptr{
+  ::CUdeviceptr data;
+  cu_device_ptr(std::size_t size){
+    const auto err = ::cuMemAlloc(&data, size);
+    if(err != CUDA_SUCCESS)
+      throw std::runtime_error("cuMemAlloc: " + cu_get_error_name(err));
+  }
+  ~cu_device_ptr(){::cuMemFree(data);}
+};
+
+static void cu_memcpy_h2d(::CUdeviceptr dst, const void* src, std::size_t size){
+  const auto err = ::cuMemcpyHtoD(dst, src, size);
+  if(err != CUDA_SUCCESS)
+    throw std::runtime_error("cuMemcpyHtoD: " + cu_get_error_name(err));
 }
 
-static void cuda_memcpy_d2h(void* dst, const void* src, std::size_t size){
-  const auto err = ::cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost);
-  if(err != cudaSuccess)
-    throw std::runtime_error(std::string{"cudaMemcpy: "} + ::cudaGetErrorName(err));
+static void cu_memcpy_d2h(void* dst, ::CUdeviceptr src, std::size_t size){
+  const auto err = ::cuMemcpyDtoH(dst, src, size);
+  if(err != CUDA_SUCCESS)
+    throw std::runtime_error("cuMemcpyDtoH: " + cu_get_error_name(err));
 }
 
-static void cuda_fillzero(void* dst, std::size_t size){
-  const auto err = ::cudaMemset(dst, 0, size);
-  if(err != cudaSuccess)
-    throw std::runtime_error(std::string{"cudaMemset: "} + ::cudaGetErrorName(err));
+static void cu_fillzero(::CUdeviceptr dst, std::size_t size){
+  const auto err = ::cuMemsetD8(dst, 0, size);
+  if(err != CUDA_SUCCESS)
+    throw std::runtime_error("cuMemsetD8: " + cu_get_error_name(err));
 }
 
-extern void launch_convolution_gpu(
-    const unsigned char* __restrict__ im,
-    int width,
-    int height,
-    const float* __restrict__ kernel,
-    int kernel_size,
-    unsigned char* __restrict__ output);
+class cu_context{
+  ::CUcontext data;
+ public:
+  cu_context(CUdevice dev, unsigned int flags = 0u){
+    const auto err = ::cuCtxCreate(&data, flags, dev);
+    if(err != CUDA_SUCCESS)
+      throw std::runtime_error("cuCtxCreate: " + cu_get_error_name(err));
+  }
+  ::CUcontext get()const noexcept{return data;}
+  ~cu_context(){::cuCtxDestroy(data);}
+  void set_current(){
+    const auto err = ::cuCtxSetCurrent(data);
+    if(err != CUDA_SUCCESS)
+      throw std::runtime_error("cuCtxSetCurrent: " + cu_get_error_name(err));
+  }
+};
 
-static void convolution_gpu(image& im, const float* kernel, int kernel_size){
+static void cu_launch_kernel(
+    ::CUfunction f,
+    void** kernel_params,
+    unsigned int grid_dim_x,
+    unsigned int grid_dim_y,
+    unsigned int grid_dim_z,
+    unsigned int block_dim_x,
+    unsigned int block_dim_y,
+    unsigned int block_dim_z,
+    unsigned int shared_mem_bytes = 0,
+    ::CUstream stream = nullptr,
+    void** extra = nullptr){
+  const auto err = ::cuLaunchKernel(f, grid_dim_x, grid_dim_y, grid_dim_z, block_dim_x, block_dim_y, block_dim_z,
+                                    shared_mem_bytes, stream, kernel_params, extra);
+  if(err != CUDA_SUCCESS)
+    throw std::runtime_error("cuLaunchKernel: " + cu_get_error_name(err));
+}
+
+static void convolution_gpu(const std::filesystem::path& nvptx, image& im, const float* kernel, int kernel_size){
   assert(kernel_size % 2 == 1);
   std::vector<unsigned char> data(im.get_width()*im.get_height());
   if(im.get_channels() == 4)
@@ -113,23 +179,36 @@ static void convolution_gpu(image& im, const float* kernel, int kernel_size){
   else if(im.get_channels() == 1)
     std::copy(im.get(), im.get() + im.calc_size(), data.begin());
 
-  auto device_image = create_cuda_buffer<unsigned char>(data.size());
-  auto device_output = create_cuda_buffer<unsigned char>(data.size());
-  auto device_kernel = create_cuda_buffer<float>(kernel_size*kernel_size);
+  cu_init();
+  auto dev = cu_get_device(0);
+  cu_context ctx(dev);
+  ctx.set_current();
+  auto device_image = cu_device_ptr(data.size() * sizeof(unsigned char));
+  auto device_output = cu_device_ptr(data.size() * sizeof(unsigned char));
+  auto device_kernel = cu_device_ptr(kernel_size*kernel_size * sizeof(float));
 
-  cuda_memcpy_h2d(device_image.get(), data.data(), data.size() * sizeof(unsigned char));
-  cuda_fillzero(device_output.get(), data.size() * sizeof(unsigned char));
-  cuda_memcpy_h2d(device_kernel.get(), kernel, kernel_size*kernel_size*sizeof(float));
+  cu_memcpy_h2d(device_image.data, data.data(), data.size() * sizeof(unsigned char));
+  cu_fillzero(device_output.data, data.size() * sizeof(unsigned char));
+  cu_memcpy_h2d(device_kernel.data, kernel, kernel_size*kernel_size*sizeof(float));
 
-  launch_convolution_gpu(
-    device_image.get(),
-    im.get_width(),
-    im.get_height(),
-    device_kernel.get(),
-    kernel_size,
-    device_output.get());
+  cu_module module(nvptx);
+  auto func = module.get_function("convolution_general");
 
-  cuda_memcpy_d2h(data.data(), device_output.get(), data.size() * sizeof(unsigned char));
+  {
+    int width = im.get_width();
+    int height = im.get_height();
+    void* kernel_args[] = {
+      &device_image.data,
+      &width,
+      &height,
+      &device_kernel.data,
+      &kernel_size,
+      &device_output.data
+    };
+    cu_launch_kernel(func, kernel_args, 32, 32, 1, (width+31)/32, (height+31)/32, 1);
+  }
+
+  cu_memcpy_d2h(data.data(), device_output.data, data.size() * sizeof(unsigned char));
 
   if(im.get_channels() == 4)
     G2GGGA(data.data(), data.size(), im.get());
@@ -138,7 +217,7 @@ static void convolution_gpu(image& im, const float* kernel, int kernel_size){
 }
 
 int main(int argc, char** argv)try{
-  if(argc != 3)
+  if(argc != 4)
     return EXIT_FAILURE;
   image im{argv[1]};
   constexpr std::size_t kernel_size = 3;
@@ -148,7 +227,7 @@ int main(int argc, char** argv)try{
     -2.f, 0, 2.f,
     -1.f, 0, 1.f
   }};
-  convolution_gpu(im, kernel.data(), kernel_size);
+  convolution_gpu(argv[3], im, kernel.data(), kernel_size);
   im.save(argv[2]);
   return EXIT_SUCCESS;
 }catch(std::exception& e){
